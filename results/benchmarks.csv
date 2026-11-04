@@ -1,0 +1,8 @@
+variant,description,program,spike_ext,cflags,input,instret,speedup_vs_scalar,instr_per_mac,predicted_class,litert_class,bit_exact,expected_instret,deviation_pct
+scalar,"RV64IMC only: scalar kernels, software requantization",model,,-O2 -DSCALAR,synthetic,4321715305,1.00,3.447,904,904,1,4321715305,0.000
+x1,Xqmac: qmac8 + rq / rq.a (2x4 tiles),model,xqmac,-O2,synthetic,575100016,7.51,0.459,904,904,1,575100016,0.000
+x1_tile4,Xqmac with 4x4 software tiles (option A),model,xqmac,-O2 -DTILE4,synthetic,469972566,9.20,0.375,904,904,1,469972566,0.000
+x2_qop4,"X2 outer-product MAC, qop4 (4x4 accumulators)",model_x2,xqmac,-O2,synthetic,311983134,13.85,0.249,904,904,1,311983134,0.000
+x2_qop8,"X2 outer-product MAC, qop8 (8x8 accumulators)",model_x2,xqmac,-O2 -DQOP8,synthetic,221898131,19.48,0.177,904,904,1,221898131,0.000
+x3_qdot4,"X3 row-vector dot product, vqdot4.vx (vector unit, VLEN 256)",model_x3,xqmac,-O2,synthetic,232143212,18.62,0.185,904,904,1,232143212,0.000
+x3_qdot8,"X3 row-vector dot product, vqdot8.vx (vector unit, VLEN 256)",model_x3,xqmac,-O2 -DQDOT8,synthetic,185962191,23.24,0.148,904,904,1,185962191,0.000
