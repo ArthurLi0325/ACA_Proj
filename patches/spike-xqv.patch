@@ -1,0 +1,103 @@
+diff --git a/riscv/xqmac.cc b/riscv/xqmac.cc
+index b649518b..ad6b91a9 100644
+--- a/riscv/xqmac.cc
++++ b/riscv/xqmac.cc
+@@ -16,6 +16,13 @@
+ //   qacc.rqa rd, rs1, n  funct3=100  same, ties away from zero
+ // c is the rs2 field (0..3); n is {funct7[0], rs2 field} (0..63). Bytes are signed int8.
+ //
++// X3 (DESIGN.md D12): row-vector dot products on the vector registers, custom-2 (0x5B). One vd holds
++// one output row; each 32-bit lane is one output column. Needs a vector unit (Zve64x), SEW = 32.
++//   vqdot4.vx vd, rs1, vs2  funct3=000  vd[i] += sum_{t<4} rs1.b[t] * vs2.e32[i].b[t], i < vl
++//   vqdot8.vx vd, rs1, vs2  funct3=001  vd[i] += sum_{t<8} rs1.b[t] * vs2.e64[i].b[t], i < vl
++// vqdot8.vx reads vs2 with EEW = 64 (EMUL = 2 * LMUL), so vs2 is a register group of 2 when LMUL = 1.
++// Lanes wrap in 32 bits like addw. vstart must be 0; elements past vl are left unchanged.
++//
+ // dot8(a, b) = sum over i = 0..7 of int8(a.byte[i]) * int8(b.byte[i]).
+ // rs2 for rq/rq.a: [31:0] M0 (Q31), [37:32] signed shift (> 0 = left), [47:40] int8 output zero
+ // point; [39:38] and [63:48] are reserved and ignored here.
+@@ -25,6 +32,7 @@
+ #include "extension.h"
+ #include "decode_macros.h"
+ #include "trap.h"
++#include "v_ext_macros.h"
+ 
+ static int32_t dot8(uint64_t a, uint64_t b)
+ {
+@@ -124,6 +132,45 @@ static reg_t xqop_insn(processor_t *p, insn_t insn, reg_t pc)
+    xqop_insn<op, false>, xqop_insn<op, false>, xqop_insn<op, false>, xqop_insn<op, false>, \
+    xqop_insn<op, true>, xqop_insn<op, true>, xqop_insn<op, true>, xqop_insn<op, true>}
+ 
++enum vq_t { VQDOT4, VQDOT8 };
++
++template <vq_t OP, bool LOGGED>
++static reg_t xqv_insn(processor_t *p, insn_t insn, reg_t pc)
++{
++  if (p->get_xlen() != 64)
++    throw trap_illegal_instruction(insn.bits());
++  require_vector(true);
++  require(P.VU.vsew == 32);
++  const float lmul = P.VU.vflmul;
++  const reg_t vd = insn.rd(), vs2 = insn.rs2();
++  require_align(vd, lmul < 1 ? 1 : lmul);
++  require_align(vs2, OP == VQDOT8 ? (lmul < 1 ? 1 : 2 * lmul) : (lmul < 1 ? 1 : lmul));
++  if (OP == VQDOT8)
++    require_noover(vd, lmul < 1 ? 1 : lmul, vs2, lmul < 1 ? 1 : 2 * lmul);
++  const reg_t a = RS1, vl = P.VU.vl->read();
++  for (reg_t i = 0; i < vl; i++) {
++    int32_t sum = 0;
++    if (OP == VQDOT4) {
++      uint32_t w = P.VU.elt<uint32_t>(vs2, i);
++      for (int t = 0; t < 4; t++)
++        sum += sb8(a, t) * sb8(w, t);
++    } else {
++      uint64_t w = P.VU.elt<uint64_t>(vs2, i);
++      for (int t = 0; t < 8; t++)
++        sum += sb8(a, t) * sb8(w, t);
++    }
++    int32_t &d = P.VU.elt<int32_t>(vd, i, true);
++    d = (int32_t)((uint32_t)d + (uint32_t)sum);
++  }
++  (void)LOGGED;
++  return pc + 4;
++}
++
++#define XQV_DESC(match, op) \
++  {match, 0xfe00707f, \
++   xqv_insn<op, false>, xqv_insn<op, false>, xqv_insn<op, false>, xqv_insn<op, false>, \
++   xqv_insn<op, true>, xqv_insn<op, true>, xqv_insn<op, true>, xqv_insn<op, true>}
++
+ template <op_t OP, bool LOGGED>
+ static reg_t xqmac_insn(processor_t *p, insn_t insn, reg_t pc)
+ {
+@@ -157,6 +204,12 @@ struct : public arg_t {
+ struct : public arg_t {
+   std::string to_string(insn_t insn) const override { return xpr_name[insn.rs2()]; }
+ } xq_rs2;
++struct : public arg_t {
++  std::string to_string(insn_t insn) const override { return vr_name[insn.rd()]; }
++} xq_vd;
++struct : public arg_t {
++  std::string to_string(insn_t insn) const override { return vr_name[insn.rs2()]; }
++} xq_vs2;
+ 
+ class xqmac_t : public extension_t
+ {
+@@ -175,6 +228,8 @@ class xqmac_t : public extension_t
+       XQOP_DESC(0x0000502b, 0xfe00707f, QROW),
+       XQOP_DESC(0x0000302b, 0xfc00707f, QRQ),
+       XQOP_DESC(0x0000402b, 0xfc00707f, QRQA),
++      XQV_DESC(0x0000005b, VQDOT4),
++      XQV_DESC(0x0000105b, VQDOT8),
+     };
+   }
+ 
+@@ -190,6 +245,8 @@ class xqmac_t : public extension_t
+       new disasm_insn_t("qacc.row", 0x0000502b, 0xfe00707f, {&xq_rs1}),
+       new disasm_insn_t("qacc.rq",  0x0000302b, 0xfc00707f, {&xq_rd, &xq_rs1}),
+       new disasm_insn_t("qacc.rqa", 0x0000402b, 0xfc00707f, {&xq_rd, &xq_rs1}),
++      new disasm_insn_t("vqdot4.vx", 0x0000005b, 0xfe00707f, {&xq_vd, &xq_rs1, &xq_vs2}),
++      new disasm_insn_t("vqdot8.vx", 0x0000105b, 0xfe00707f, {&xq_vd, &xq_rs1, &xq_vs2}),
+     };
+   }
+ };
