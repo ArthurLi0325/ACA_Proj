@@ -1,0 +1,9 @@
+numpy
+ai-edge-litert       # LiteRT (TFLite) interpreter: reference outputs and intermediate tensors
+ai-edge-quantizer    # static INT8 post-training quantization (STATIC_WI8_AI8 / WI8_AI16 recipes)
+tflite               # flatbuffer parser for reading graph, weights, quant params
+huggingface_hub      # download models / datasets from huggingface.co
+pyarrow              # read mini-imagenet parquet shards
+pillow               # image preprocessing
+matplotlib
+pandas
