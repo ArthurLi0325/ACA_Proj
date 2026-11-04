@@ -1,0 +1,104 @@
+--- a/riscv/xqmac.cc
++++ b/riscv/xqmac.cc
+@@ -6,6 +6,16 @@
+ //   rq    rd, rs1, rs2   custom-0 funct3=100  requantize rs1 with params in rs2, ties toward +inf
+ //   rq.a  rd, rs1, rs2   custom-0 funct3=101  same, ties away from zero
+ //
++// X2 (DESIGN.md D10; 4x4 and 8x8 both kept for the area comparison): outer-product MAC with an internal 8x8 int32
++// accumulator array ACC (row-major, ACC[i*8 + j]), custom-1 (0x2B):
++//   qop4     rs1, rs2    funct3=000  ACC[i][j] += sum_{t<2} a.b[2i+t] * b.b[2j+t], i, j < 4 (32 MACs)
++//   qop8     rs1, rs2    funct3=001  ACC[i][j] += a.b[i] * b.b[j], i, j < 8          (64 MACs)
++//   qacc.col rs1, c      funct3=010  ACC[i][2c] = rs1[31:0], ACC[i][2c+1] = rs1[63:32], all i
++//   qacc.row rs1, c      funct3=101  ACC[2c][j] += rs1[31:0], ACC[2c+1][j] += rs1[63:32], all j
++//   qacc.rq  rd, rs1, n  funct3=011  rd = rq(ACC[n], params rs1), ties toward +inf
++//   qacc.rqa rd, rs1, n  funct3=100  same, ties away from zero
++// c is the rs2 field (0..3); n is {funct7[0], rs2 field} (0..63). Bytes are signed int8.
++//
+ // dot8(a, b) = sum over i = 0..7 of int8(a.byte[i]) * int8(b.byte[i]).
+ // rs2 for rq/rq.a: [31:0] M0 (Q31), [37:32] signed shift (> 0 = left), [47:40] int8 output zero
+ // point; [39:38] and [63:48] are reserved and ignored here.
+@@ -62,6 +72,58 @@
+ 
+ enum op_t { QMAC8, DOT8, RQ, RQA };
+ 
++static int32_t acc8x8[64];
++
++static inline int32_t sb8(uint64_t x, int i) { return (int8_t)(x >> (8 * i)); }
++
++enum qop_t { QOP4, QOP8, QCOL, QROW, QRQ, QRQA };
++
++template <qop_t OP, bool LOGGED>
++static reg_t xqop_insn(processor_t *p, insn_t insn, reg_t pc)
++{
++  if (p->get_xlen() != 64)
++    throw trap_illegal_instruction(insn.bits());
++  reg_t a = RS1, b = RS2;
++  unsigned c = insn.rs2();
++  switch (OP) {
++  case QOP4:
++    for (int i = 0; i < 4; i++)
++      for (int j = 0; j < 4; j++)
++        acc8x8[i * 8 + j] += sb8(a, 2 * i) * sb8(b, 2 * j) + sb8(a, 2 * i + 1) * sb8(b, 2 * j + 1);
++    return pc + 4;
++  case QOP8:
++    for (int i = 0; i < 8; i++)
++      for (int j = 0; j < 8; j++)
++        acc8x8[i * 8 + j] += sb8(a, i) * sb8(b, j);
++    return pc + 4;
++  case QCOL:
++    for (int i = 0; i < 8; i++) {
++      acc8x8[i * 8 + 2 * (c & 3)] = (int32_t)a;
++      acc8x8[i * 8 + 2 * (c & 3) + 1] = (int32_t)(a >> 32);
++    }
++    return pc + 4;
++  case QROW:
++    for (int j = 0; j < 8; j++) {
++      acc8x8[2 * (c & 3) * 8 + j] += (int32_t)a;
++      acc8x8[(2 * (c & 3) + 1) * 8 + j] += (int32_t)(a >> 32);
++    }
++    return pc + 4;
++  default: {
++    unsigned n = ((insn.bits() >> 25) & 1) << 5 | c;
++    reg_t result = requantize((uint32_t)acc8x8[n], a, OP == QRQA);
++    if (LOGGED)
++      STATE.log_reg_write[insn.rd() << 4] = {result, 0};
++    STATE.XPR.write(insn.rd(), result);
++    return pc + 4;
++  }
++  }
++}
++
++#define XQOP_DESC(match, mask, op) \
++  {match, mask, \
++   xqop_insn<op, false>, xqop_insn<op, false>, xqop_insn<op, false>, xqop_insn<op, false>, \
++   xqop_insn<op, true>, xqop_insn<op, true>, xqop_insn<op, true>, xqop_insn<op, true>}
++
+ template <op_t OP, bool LOGGED>
+ static reg_t xqmac_insn(processor_t *p, insn_t insn, reg_t pc)
+ {
+@@ -107,6 +169,12 @@
+       XQMAC_DESC(0x0000100b, DOT8),
+       XQMAC_DESC(0x0000400b, RQ),
+       XQMAC_DESC(0x0000500b, RQA),
++      XQOP_DESC(0x0000002b, 0xfe00707f, QOP4),
++      XQOP_DESC(0x0000102b, 0xfe00707f, QOP8),
++      XQOP_DESC(0x0000202b, 0xfe00707f, QCOL),
++      XQOP_DESC(0x0000502b, 0xfe00707f, QROW),
++      XQOP_DESC(0x0000302b, 0xfc00707f, QRQ),
++      XQOP_DESC(0x0000402b, 0xfc00707f, QRQA),
+     };
+   }
+ 
+@@ -116,6 +184,12 @@
+       new disasm_insn_t("dot8",  0x0000100b, 0xfe00707f, {&xq_rd, &xq_rs1, &xq_rs2}),
+       new disasm_insn_t("rq",    0x0000400b, 0xfe00707f, {&xq_rd, &xq_rs1, &xq_rs2}),
+       new disasm_insn_t("rq.a",  0x0000500b, 0xfe00707f, {&xq_rd, &xq_rs1, &xq_rs2}),
++      new disasm_insn_t("qop4",  0x0000002b, 0xfe00707f, {&xq_rs1, &xq_rs2}),
++      new disasm_insn_t("qop8",  0x0000102b, 0xfe00707f, {&xq_rs1, &xq_rs2}),
++      new disasm_insn_t("qacc.col", 0x0000202b, 0xfe00707f, {&xq_rs1}),
++      new disasm_insn_t("qacc.row", 0x0000502b, 0xfe00707f, {&xq_rs1}),
++      new disasm_insn_t("qacc.rq",  0x0000302b, 0xfc00707f, {&xq_rd, &xq_rs1}),
++      new disasm_insn_t("qacc.rqa", 0x0000402b, 0xfc00707f, {&xq_rd, &xq_rs1}),
+     };
+   }
+ };

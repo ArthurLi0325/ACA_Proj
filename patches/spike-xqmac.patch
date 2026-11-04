@@ -1,0 +1,151 @@
+diff --git a/riscv/riscv.mk.in b/riscv/riscv.mk.in
+index df29533..870ec42 100644
+--- a/riscv/riscv.mk.in
++++ b/riscv/riscv.mk.in
+@@ -55,6 +55,7 @@ riscv_precompiled_hdrs = \
+ 
+ riscv_srcs = \
+ 	processor.cc \
++	xqmac.cc \
+ 	execute.cc \
+ 	dts.cc \
+ 	sim.cc \
+diff --git a/riscv/xqmac.cc b/riscv/xqmac.cc
+new file mode 100644
+index 0000000..30aa231
+--- /dev/null
++++ b/riscv/xqmac.cc
+@@ -0,0 +1,123 @@
++// Xqmac: packed INT8 multiply-accumulate and requantization for quantized NN inference.
++// ACA term project, semantics and encoding in DESIGN.md D4-D6. Enable with --extension=xqmac.
++//
++//   qmac8 rd, rs1, rs2   custom-0 funct3=000  rd = sext32(rd[31:0] + dot8(rs1, rs2))
++//   dot8  rd, rs1, rs2   custom-0 funct3=001  rd = sext32(dot8(rs1, rs2))
++//   rq    rd, rs1, rs2   custom-0 funct3=100  requantize rs1 with params in rs2, ties toward +inf
++//   rq.a  rd, rs1, rs2   custom-0 funct3=101  same, ties away from zero
++//
++// dot8(a, b) = sum over i = 0..7 of int8(a.byte[i]) * int8(b.byte[i]).
++// rs2 for rq/rq.a: [31:0] M0 (Q31), [37:32] signed shift (> 0 = left), [47:40] int8 output zero
++// point; [39:38] and [63:48] are reserved and ignored here.
++// Built into spike itself (riscv.mk.in + spike_main.mk.in) rather than libcustomext.so: loading
++// a customext library aborts with "Plugin imsic_mmio already registered" on this Spike version.
++#include "insn_macros.h"
++#include "extension.h"
++#include "decode_macros.h"
++#include "trap.h"
++
++static int32_t dot8(uint64_t a, uint64_t b)
++{
++  int32_t sum = 0;
++  for (int i = 0; i < 8; i++)
++    sum += (int32_t)(int8_t)(a >> (8 * i)) * (int8_t)(b >> (8 * i));
++  return sum;
++}
++
++// gemmlowp SaturatingRoundingDoublingHighMul: round(a * b / 2^31); exact halves round toward
++// +inf for both signs (the negative nudge is 1 - 2^30 and the division truncates).
++static int32_t srdhm(int32_t a, int32_t b)
++{
++  if (a == INT32_MIN && b == INT32_MIN)
++    return INT32_MAX;
++  int64_t ab = (int64_t)a * b;
++  int64_t nudge = ab >= 0 ? (1 << 30) : (1 - (1 << 30));
++  return (int32_t)((ab + nudge) / ((int64_t)1 << 31));
++}
++
++static int64_t requantize(uint64_t acc_reg, uint64_t params, bool ties_away)
++{
++  int32_t acc = (int32_t)acc_reg;
++  int32_t m0 = (int32_t)params;
++  int sh = (int)((int64_t)(params << 26) >> 58);         // sext(rs2[37:32])
++  int32_t zp = (int8_t)(params >> 40);                    // sext(rs2[47:40])
++
++  int left = sh > 0 ? sh : 0;
++  int r = sh > 0 ? 0 : -sh;                               // 0..32
++  int64_t v = srdhm((int32_t)((uint32_t)acc << left), m0);
++  if (r > 0) {
++    if (ties_away) {                                      // gemmlowp RoundingDivideByPOT
++      int64_t mask = ((int64_t)1 << r) - 1;
++      int64_t threshold = (mask >> 1) + (v < 0 ? 1 : 0);
++      v = (v >> r) + ((v & mask) > threshold ? 1 : 0);
++    } else {                                              // LiteRT FC: ties toward +inf
++      v = (v + ((int64_t)1 << (r - 1))) >> r;
++    }
++  }
++  v += zp;
++  if (v < -128) v = -128;
++  if (v > 127) v = 127;
++  return v;
++}
++
++enum op_t { QMAC8, DOT8, RQ, RQA };
++
++template <op_t OP, bool LOGGED>
++static reg_t xqmac_insn(processor_t *p, insn_t insn, reg_t pc)
++{
++  if (p->get_xlen() != 64)
++    throw trap_illegal_instruction(insn.bits());
++  reg_t a = RS1, b = RS2;
++  reg_t result;
++  switch (OP) {
++  case QMAC8: result = sext32((uint32_t)READ_REG(insn.rd()) + (uint32_t)dot8(a, b)); break;
++  case DOT8:  result = sext32(dot8(a, b)); break;
++  case RQ:    result = requantize(a, b, false); break;
++  case RQA:   result = requantize(a, b, true); break;
++  }
++  if (LOGGED)
++    STATE.log_reg_write[insn.rd() << 4] = {result, 0};
++  STATE.XPR.write(insn.rd(), result);
++  return pc + 4;
++}
++
++#define XQMAC_DESC(match, op) \
++  {match, 0xfe00707f, \
++   xqmac_insn<op, false>, xqmac_insn<op, false>, xqmac_insn<op, false>, xqmac_insn<op, false>, \
++   xqmac_insn<op, true>, xqmac_insn<op, true>, xqmac_insn<op, true>, xqmac_insn<op, true>}
++
++struct : public arg_t {
++  std::string to_string(insn_t insn) const override { return xpr_name[insn.rd()]; }
++} xq_rd;
++struct : public arg_t {
++  std::string to_string(insn_t insn) const override { return xpr_name[insn.rs1()]; }
++} xq_rs1;
++struct : public arg_t {
++  std::string to_string(insn_t insn) const override { return xpr_name[insn.rs2()]; }
++} xq_rs2;
++
++class xqmac_t : public extension_t
++{
++ public:
++  const char* name() const override { return "xqmac"; }
++
++  std::vector<insn_desc_t> get_instructions(const processor_t &) override {
++    return {
++      XQMAC_DESC(0x0000000b, QMAC8),
++      XQMAC_DESC(0x0000100b, DOT8),
++      XQMAC_DESC(0x0000400b, RQ),
++      XQMAC_DESC(0x0000500b, RQA),
++    };
++  }
++
++  std::vector<disasm_insn_t *> get_disasms(const processor_t *) override {
++    return {
++      new disasm_insn_t("qmac8", 0x0000000b, 0xfe00707f, {&xq_rd, &xq_rs1, &xq_rs2}),
++      new disasm_insn_t("dot8",  0x0000100b, 0xfe00707f, {&xq_rd, &xq_rs1, &xq_rs2}),
++      new disasm_insn_t("rq",    0x0000400b, 0xfe00707f, {&xq_rd, &xq_rs1, &xq_rs2}),
++      new disasm_insn_t("rq.a",  0x0000500b, 0xfe00707f, {&xq_rd, &xq_rs1, &xq_rs2}),
++    };
++  }
++};
++
++REGISTER_EXTENSION(xqmac, []() { static xqmac_t ext; return &ext; })
+diff --git a/spike_main/spike_main.mk.in b/spike_main/spike_main.mk.in
+index c842c4e..ca330a3 100644
+--- a/spike_main/spike_main.mk.in
++++ b/spike_main/spike_main.mk.in
+@@ -17,4 +17,4 @@ spike_main_CFLAGS = -fPIC
+ 
+ # This hack adds all symbols from extension.o to spike's dynamic symbol
+ # table, which is required for dynamically loaded --extension libraries
+-spike_main_LDFLAGS = extension.o
++spike_main_LDFLAGS = extension.o xqmac.o
