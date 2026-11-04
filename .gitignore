@@ -1,0 +1,9 @@
+build/
+.venv/
+__pycache__/
+*.pyc
+*.hist
+*.log
+models/*.tflite
+!models/deit_tiny_w8a8.tflite
+!results/**/*.csv
